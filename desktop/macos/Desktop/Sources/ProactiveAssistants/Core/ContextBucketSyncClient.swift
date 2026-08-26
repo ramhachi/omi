@@ -77,7 +77,7 @@ enum ContextBucketSyncPayload {
     let bucketPayloads: [[String: Any]] = publishedBuckets.map { bucket in
       var payload: [String: Any] = [
         "bucket_id": bucket.bucketID,
-        "subject_kind": bucket.subjectKind,
+        "subject_kind": wireSubjectKind(bucket.subjectKind),
         "notify_worthiness": bucket.notifyWorthiness,
         "visit_count": bucket.visitCount,
         "device_updated_at": formatter.string(from: bucket.updatedAt),
@@ -118,6 +118,26 @@ enum ContextBucketSyncPayload {
 
   static func purgeBody(bucketIDs: [String]) -> [String: Any] {
     ["bucket_ids": bucketIDs]
+  }
+
+  /// Map locally stored subject kinds onto the backend wire enum.
+  ///
+  /// Local minting writes `context`, `url`, `file`, and `app_window`. The
+  /// backend only accepts `app`, `document`, `destination`, and `handle`, so
+  /// publishing the stored string unchanged is a 422 and the fact never lands.
+  static func wireSubjectKind(_ stored: String) -> String {
+    switch stored {
+    case "app", "document", "destination", "handle":
+      return stored
+    case "url":
+      return "destination"
+    case "file":
+      return "document"
+    case "app_window", "context":
+      return "app"
+    default:
+      return "handle"
+    }
   }
 
   /// Split a retraction across requests rather than truncating it.

@@ -17,6 +17,71 @@ struct ContextBucketSyncCursor: Equatable, Sendable, Codable {
   let bucketID: String
 }
 
+/// Owner-scoped persistence for the sync watermark.
+///
+/// A global key lets account B inherit account A's far-ahead cursor and skip
+/// its older buckets until they are touched again.
+enum ContextBucketSyncCursorStore {
+  static let legacyKey = "contextBucketSyncCursor"
+
+  static func key(ownerID: String) -> String {
+    "contextBucketSyncCursor.\(ownerID)"
+  }
+
+  static func load(ownerID: String, from defaults: UserDefaults = .standard) -> ContextBucketSyncCursor? {
+    guard !ownerID.isEmpty, let data = defaults.data(forKey: key(ownerID: ownerID)) else { return nil }
+    return try? JSONDecoder().decode(ContextBucketSyncCursor.self, from: data)
+  }
+
+  static func save(
+    _ cursor: ContextBucketSyncCursor?,
+    ownerID: String,
+    to defaults: UserDefaults = .standard
+  ) {
+    guard !ownerID.isEmpty else { return }
+    defaults.removeObject(forKey: legacyKey)
+    let defaultsKey = key(ownerID: ownerID)
+    guard let cursor, let data = try? JSONEncoder().encode(cursor) else {
+      defaults.removeObject(forKey: defaultsKey)
+      return
+    }
+    defaults.set(data, forKey: defaultsKey)
+  }
+}
+
+/// Serializes a sync pass against exclude-driven purge.
+///
+/// Actor isolation alone is not enough: `runPass` suspends on the network, and
+/// Swift actors are reentrant at `await`. Without this gate, exclude can finish
+/// local delete + backend retract (and clear the journal) while a staged POST
+/// is still in flight, then that POST recreates the retracted facts.
+actor ContextBucketSyncPassGate {
+  private var held = false
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+
+  func acquire() async {
+    if !held {
+      held = true
+      return
+    }
+    await withCheckedContinuation { waiters.append($0) }
+  }
+
+  func release() {
+    if waiters.isEmpty {
+      held = false
+      return
+    }
+    waiters.removeFirst().resume()
+  }
+
+  func withExclusive<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
+    await acquire()
+    defer { release() }
+    return try await body()
+  }
+}
+
 enum ContextBucketSyncSelection {
   static let bucketLimit = ContextBucketSyncPayload.bucketLimit
   static let factLimitPerBucket = 40
@@ -117,22 +182,7 @@ actor ContextBucketSyncScheduler {
   /// An in-memory cursor restarts at epoch every launch, so a device restarted
   /// regularly would keep re-publishing its oldest buckets and never reach its
   /// newest ones.
-  private var cursor: ContextBucketSyncCursor? {
-    get {
-      guard let data = UserDefaults.standard.data(forKey: Self.cursorDefaultsKey) else { return nil }
-      return try? JSONDecoder().decode(ContextBucketSyncCursor.self, from: data)
-    }
-    set {
-      let defaults = UserDefaults.standard
-      guard let newValue, let data = try? JSONEncoder().encode(newValue) else {
-        defaults.removeObject(forKey: Self.cursorDefaultsKey)
-        return
-      }
-      defaults.set(data, forKey: Self.cursorDefaultsKey)
-    }
-  }
-
-  private static let cursorDefaultsKey = "contextBucketSyncCursor"
+  private let passGate = ContextBucketSyncPassGate()
   private let client: ContextBucketSyncClient
 
   init(client: ContextBucketSyncClient = .shared) {
@@ -157,6 +207,10 @@ actor ContextBucketSyncScheduler {
     isRunning = false
   }
 
+  func withExclusivePass<T: Sendable>(_ body: @Sendable () async throws -> T) async throws -> T {
+    try await passGate.withExclusive(body)
+  }
+
   func runPass(now: Date = Date()) async {
     let enabled = await MainActor.run { ContextBucketsFeature.isBackendSyncEnabled }
     guard enabled else { return }
@@ -167,7 +221,20 @@ actor ContextBucketSyncScheduler {
     let (pool, _) = await RewindDatabase.shared.getDatabaseQueueWithGeneration()
     guard let pool else { return }
 
-    let position = cursor
+    try? await withExclusivePass {
+      await self.publishStagedBuckets(
+        pool: pool,
+        authorizationSnapshot: authorizationSnapshot,
+        now: now)
+    }
+  }
+
+  private func publishStagedBuckets(
+    pool: DatabasePool,
+    authorizationSnapshot: RuntimeOwnerAuthorizationSnapshot,
+    now: Date
+  ) async {
+    let position = ContextBucketSyncCursorStore.load(ownerID: authorizationSnapshot.ownerID)
     let staged: ([ContextBucketSyncBucket], [ContextBucketSyncFact])
     do {
       staged = try await pool.read { db -> ([ContextBucketSyncBucket], [ContextBucketSyncFact]) in
@@ -200,7 +267,9 @@ actor ContextBucketSyncScheduler {
         authorizedBy: authorizationSnapshot)
       // Only advance past rows the server accepted, so a failure re-sends them.
       if let last = staged.0.last {
-        cursor = ContextBucketSyncCursor(updatedAt: last.updatedAt, bucketID: last.bucketID)
+        ContextBucketSyncCursorStore.save(
+          ContextBucketSyncCursor(updatedAt: last.updatedAt, bucketID: last.bucketID),
+          ownerID: authorizationSnapshot.ownerID)
       }
     } catch {
       log("ContextBucketSyncScheduler: sync failed \(error.localizedDescription)")

@@ -85,7 +85,9 @@ class FakeQuery:
             field, direction = self.order
             reverse = str(direction).endswith('DESCENDING')
             rows.sort(key=lambda snapshot: snapshot.to_dict().get(field), reverse=reverse)
-        return iter(rows[: self.limit_value] if self.limit_value is not None else rows)
+        limited = rows[: self.limit_value] if self.limit_value is not None else rows
+        self.database.streamed_snapshots += len(limited)
+        return iter(limited)
 
 
 class FakeCollection(FakeQuery):
@@ -160,6 +162,7 @@ class FakeDB:
     def __init__(self):
         self.rows = {}
         self.committed_batch_sizes = []
+        self.streamed_snapshots = 0
 
     def collection(self, name):
         return FakeCollection(self, (name,))
@@ -466,6 +469,17 @@ def test_expired_fact_collection_is_bounded_so_one_sweep_cannot_stall_a_request(
     deleted = context_buckets_db.collect_expired_context_facts('u1', now=NOW, firestore_client=fake_db)
 
     assert deleted == context_buckets_db.EXPIRED_FACT_COLLECT_LIMIT
+
+
+def test_expired_fact_collection_bounds_how_many_documents_are_read(fake_db):
+    live_count = context_buckets_db.EXPIRED_FACT_SCAN_LIMIT + 80
+    seed_facts(fake_db, live_count, prefix='live', expires_at=NOW + timedelta(hours=1))
+    seed_facts(fake_db, 5, prefix='dead', expires_at=NOW - timedelta(minutes=1))
+    fake_db.streamed_snapshots = 0
+
+    context_buckets_db.collect_expired_context_facts('u1', now=NOW, firestore_client=fake_db)
+
+    assert fake_db.streamed_snapshots <= context_buckets_db.EXPIRED_FACT_SCAN_LIMIT
 
 
 def test_expired_fact_collection_stops_at_the_requested_limit(fake_db):

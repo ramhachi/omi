@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 
 @testable import Omi_Computer
@@ -148,4 +149,137 @@ final class ContextBucketSyncPayloadTests: XCTestCase {
     XCTAssertEqual(body["bucket_ids"] as? [String], ["bucket-1", "bucket-2"])
   }
 
+  func testLocalSubjectKindsMapOntoTheBackendWireEnum() {
+    XCTAssertEqual(ContextBucketSyncPayload.wireSubjectKind("context"), "app")
+    XCTAssertEqual(ContextBucketSyncPayload.wireSubjectKind("url"), "destination")
+    XCTAssertEqual(ContextBucketSyncPayload.wireSubjectKind("file"), "document")
+    XCTAssertEqual(ContextBucketSyncPayload.wireSubjectKind("app_window"), "app")
+    XCTAssertEqual(ContextBucketSyncPayload.wireSubjectKind("document"), "document")
+    XCTAssertEqual(ContextBucketSyncPayload.wireSubjectKind("destination"), "destination")
+    XCTAssertEqual(ContextBucketSyncPayload.wireSubjectKind("app"), "app")
+    XCTAssertEqual(ContextBucketSyncPayload.wireSubjectKind("handle"), "handle")
+    XCTAssertEqual(ContextBucketSyncPayload.wireSubjectKind("unknown-kind"), "handle")
+  }
+
+  func testPublishedPayloadUsesTheMappedSubjectKind() {
+    let body = ContextBucketSyncPayload.body(
+      deviceID: "macos_abc",
+      buckets: [
+        ContextBucketSyncBucket(
+          bucketID: "bucket-1",
+          subjectKind: "context",
+          workstreamID: nil,
+          notifyWorthiness: 0.7,
+          visitCount: 3,
+          lastVisitedAt: now,
+          updatedAt: now)
+      ],
+      facts: [fact()])
+
+    XCTAssertEqual(buckets(in: body)[0]["subject_kind"] as? String, "app")
+  }
+
+}
+
+final class ContextBucketSyncCursorStoreTests: XCTestCase {
+  func testCursorIsIsolatedPerOwner() throws {
+    let defaults = try XCTUnwrap(
+      UserDefaults(suiteName: "ContextBucketSyncCursorStoreTests.\(UUID().uuidString)"))
+    let first = ContextBucketSyncCursor(
+      updatedAt: Date(timeIntervalSince1970: 1_800_000_000), bucketID: "owner-a-last")
+    let second = ContextBucketSyncCursor(
+      updatedAt: Date(timeIntervalSince1970: 1_900_000_000), bucketID: "owner-b-last")
+
+    ContextBucketSyncCursorStore.save(first, ownerID: "owner-a", to: defaults)
+    ContextBucketSyncCursorStore.save(second, ownerID: "owner-b", to: defaults)
+
+    XCTAssertEqual(ContextBucketSyncCursorStore.load(ownerID: "owner-a", from: defaults), first)
+    XCTAssertEqual(ContextBucketSyncCursorStore.load(ownerID: "owner-b", from: defaults), second)
+    XCTAssertNil(ContextBucketSyncCursorStore.load(ownerID: "owner-c", from: defaults))
+  }
+
+  func testUnscopedLegacyCursorIsNotAdoptedByALaterOwner() throws {
+    let defaults = try XCTUnwrap(
+      UserDefaults(suiteName: "ContextBucketSyncCursorStoreTests.legacy.\(UUID().uuidString)"))
+    let leftover = ContextBucketSyncCursor(
+      updatedAt: Date(timeIntervalSince1970: 1_800_000_000), bucketID: "previous-owner-last")
+    defaults.set(try JSONEncoder().encode(leftover), forKey: ContextBucketSyncCursorStore.legacyKey)
+
+    XCTAssertNil(ContextBucketSyncCursorStore.load(ownerID: "new-owner", from: defaults))
+  }
+}
+
+final class ContextBucketSyncPassGateTests: XCTestCase {
+  func testExclusivePassHoldsWaitersUntilTheHolderReleases() async throws {
+    let gate = ContextBucketSyncPassGate()
+    let order = LockedOrder()
+    let releaseFirst = LockedContinuation()
+
+    let first = Task {
+      try await gate.withExclusive {
+        order.append(1)
+        await releaseFirst.wait()
+        order.append(2)
+      }
+    }
+
+    while order.snapshot != [1] {
+      await Task.yield()
+    }
+
+    let second = Task {
+      try await gate.withExclusive {
+        order.append(3)
+      }
+    }
+
+    await Task.yield()
+    XCTAssertEqual(order.snapshot, [1], "exclude must not run while a sync pass is in flight")
+
+    releaseFirst.resume()
+    try await first.value
+    try await second.value
+    XCTAssertEqual(order.snapshot, [1, 2, 3])
+  }
+}
+
+private final class LockedOrder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stored: [Int] = []
+
+  func append(_ value: Int) {
+    lock.withLock { stored.append(value) }
+  }
+
+  var snapshot: [Int] {
+    lock.withLock { stored }
+  }
+}
+
+private final class LockedContinuation: @unchecked Sendable {
+  private let lock = NSLock()
+  private var continuation: CheckedContinuation<Void, Never>?
+  private var resumed = false
+
+  func wait() async {
+    await withCheckedContinuation { continuation in
+      lock.lock()
+      if resumed {
+        lock.unlock()
+        continuation.resume()
+        return
+      }
+      self.continuation = continuation
+      lock.unlock()
+    }
+  }
+
+  func resume() {
+    lock.lock()
+    resumed = true
+    let pending = continuation
+    continuation = nil
+    lock.unlock()
+    pending?.resume()
+  }
 }

@@ -48,6 +48,10 @@ MAX_BATCH_OPERATIONS = 450
 # are bounded. An unbounded stream would bill the whole collection on every call,
 # which is the cost the sweep exists to remove.
 EXPIRED_FACT_COLLECT_LIMIT = 500
+# Documents read to find expired rows, including live ones. The collect cap only
+# bounds deletes; without this, a user with many live facts pays a full-collection
+# read on every device sync.
+EXPIRED_FACT_SCAN_LIMIT = 2000
 
 
 def _get_db(firestore_client: Any = None) -> Any:
@@ -355,7 +359,7 @@ def collect_expired_context_facts(
     client = _get_db(firestore_client)
     moment = now or datetime.now(timezone.utc)
     expired = []
-    for snapshot in _facts_collection(uid, firestore_client=client).stream():
+    for snapshot in _facts_collection(uid, firestore_client=client).limit(EXPIRED_FACT_SCAN_LIMIT).stream():
         expires_at = _as_aware(_snapshot_dict(snapshot).get('expires_at'))
         if expires_at is not None and expires_at <= moment:
             expired.append(snapshot.reference)
@@ -385,6 +389,8 @@ def _delete_in_batches(client: Any, refs: Any) -> int:
 
 __all__ = [
     'BUCKETS_COLLECTION',
+    'EXPIRED_FACT_COLLECT_LIMIT',
+    'EXPIRED_FACT_SCAN_LIMIT',
     'FACTS_COLLECTION',
     'MAX_BATCH_OPERATIONS',
     'collect_expired_context_facts',

@@ -525,10 +525,12 @@ class RewindSettings: ObservableObject {
     RewindPendingContextBucketPurgeJournal.enqueue(appName: appName, ownerID: ownerID)
     Task { @MainActor in
       do {
-        await Self.journalRetraction(appName: appName, ownerID: ownerID)
-        _ = try await ContextBucketStore.shared.purgeExcludedApp(appName)
-        RewindPendingContextBucketPurgeJournal.complete(appName: appName, ownerID: ownerID)
-        await Self.retractPublishedBuckets(ownerID: ownerID)
+        try await ContextBucketSyncScheduler.shared.withExclusivePass {
+          await Self.journalRetraction(appName: appName, ownerID: ownerID)
+          _ = try await ContextBucketStore.shared.purgeExcludedApp(appName)
+          RewindPendingContextBucketPurgeJournal.complete(appName: appName, ownerID: ownerID)
+          await Self.retractPublishedBuckets(ownerID: ownerID)
+        }
       } catch {
         logError("RewindSettings: purge-on-exclude failed", error: error)
       }
@@ -552,10 +554,12 @@ class RewindSettings: ObservableObject {
     for appName in pending {
       guard RuntimeOwnerIdentity.currentOwnerId() == ownerID else { return }
       do {
-        await Self.journalRetraction(appName: appName, ownerID: ownerID)
-        _ = try await ContextBucketStore.shared.purgeExcludedApp(appName)
-        RewindPendingContextBucketPurgeJournal.complete(appName: appName, ownerID: ownerID)
-        await Self.retractPublishedBuckets(ownerID: ownerID)
+        try await ContextBucketSyncScheduler.shared.withExclusivePass {
+          await Self.journalRetraction(appName: appName, ownerID: ownerID)
+          _ = try await ContextBucketStore.shared.purgeExcludedApp(appName)
+          RewindPendingContextBucketPurgeJournal.complete(appName: appName, ownerID: ownerID)
+          await Self.retractPublishedBuckets(ownerID: ownerID)
+        }
       } catch {
         logError("RewindSettings: deferred purge-on-exclude failed", error: error)
       }
